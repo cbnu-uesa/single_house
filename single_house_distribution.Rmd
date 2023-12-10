@@ -1,0 +1,462 @@
+---
+title: "Single-house distribution"
+author: "Sunwoong Yoon and Kyusang Kwon"
+date: "2023-08-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 필요 패키지 로드
+
+분석을 위해 필요한 패키지를 로드합니다. 설치되지 않은 경우 install.package()로 설치 필요.
+
+```{r, include=FALSE}
+library(tidyverse)
+library(sf)
+library(httr)
+library(jsonlite)
+library(lmtest)
+library(sandwich)
+```
+
+# 분석경로 설정
+
+본인의 작업경로를 설정합니다. 해당 경로에 이 마크다운 혹은 R코드파일을 위치시킵니다. 데이터는 하위폴더에 지정된 이름으로 각각 저장합니다.
+
+```{r, echo=TRUE}
+setwd("D:/Analysis/single_house/")
+```
+
+# 데이터 가져오기
+
+## 1. 서울 동 단위 SHP 가져오기
+
+```{r}
+seoul <- read_sf("clean_input/seoul.gpkg") %>%
+  st_make_valid() %>% # 유의하지 않은 폴리곤 조정
+  st_transform(5179) %>% # 4326 -> 5179 변환
+  mutate(area = as.numeric(st_area(geom))/1000000) # 동면적을 km2로 변환
+dong_center <- st_centroid(seoul) # 동 중심점 추출 -> 나중에 가장 가까운 대학 간 거리분석을 위해 미리 뽑음
+```
+
+## 2. 접근성 관련 데이터 가져오기
+
+### 1) 동별 지하철 역 수 산정
+- 출처: 서울교통빅데이터
+```{r}
+subway <- read_csv("raw_input/seoul_subway.csv") %>%
+  st_as_sf(coords = c("환승역X좌표", "환승역Y좌표"), crs = 4326) %>% st_transform(5179) %>%
+  st_join(seoul, join = st_within) %>%
+  st_drop_geometry() %>%
+  group_by(행정동코드) %>% 
+  summarise(n_subway = n())
+```
+
+### 2) 동별 버스정류장 수 산정
+- 출처: 서울교통빅데이터
+```{r}
+busstop <-read_csv("raw_input/seoul_busstop.csv") %>%
+  mutate(x = gsub("﻿", "", 좌표X),
+         y = gsub("﻿", "", 좌표Y)) %>%
+  filter(`정류장지역유형(0:서울/1:경기/2:인천)`=="﻿0") %>%
+  filter(`가상정류장여부`=="﻿0") %>%
+  filter(`정류장이용여부`=="﻿1") %>%
+  st_as_sf(coords = c("x", "y"), crs = 4326) %>% st_transform(5179) %>%
+  st_join(seoul, join = st_within) %>%
+  st_drop_geometry() %>%
+  group_by(행정동코드) %>% 
+  summarise(n_busstop = n())
+```
+
+### 3) 동별 주택유형별 수 산정
+- 출처: SGIS API
+- 유형 중 "전체"열이 해당 동의 전체 주택스톡을 의미
+- 동 코드 조정 후 병합을 위해 동별 코드로 그룹화하여 요약한 수치를 wide 타입으로 피벗함
+
+```{r}
+housetype <- read_delim("raw_input/seoul_housetype_2021.txt", delim ='\t', locale = locale(encoding = 'utf-8')) %>%
+  mutate(adm_cd2 = adm_cd / 10) %>% 
+  mutate(adm_cd2 = case_when(adm_cd2 == 1117073 ~ 1117068,  # 오류2동
+                             adm_cd2 == 1117074 ~ 1117068,  # 항동 -> 오류2동
+                             adm_cd2 == 1125075 ~ 1125051,  # 강일동 -> 오류2동
+                             adm_cd2 == 1125076 ~ 1125052,  # 상일1동 -> 오류2동
+                             adm_cd2 == 1125077 ~ 1125052,  # 상일2동 -> 오류2동
+                             TRUE ~ adm_cd2) 
+  ) %>%
+  group_by(adm_cd2, type_nm) %>% summarise(house_cnt = sum(house_cnt)) %>%
+  pivot_wider(id_cols = adm_cd2, names_from = type_nm, values_from = house_cnt)
+```
+- 유형구분 없이 20m2 이하, 20~40m2 이하 주택 수만 추출하였으므로 동단위 그룹핑 후 요약만 수행
+
+```{r}
+housearea <- read_delim("raw_input/seoul_housearea_2021.txt", delim ='\t', locale = locale(encoding = 'utf-8')) %>%
+  mutate(adm_cd2 = adm_cd / 10) %>% 
+  mutate(adm_cd2 = case_when(adm_cd2 == 1117073 ~ 1117068,  # 오류2동
+                             adm_cd2 == 1117074 ~ 1117068,  # 항동 -> 오류2동
+                             adm_cd2 == 1125075 ~ 1125051,  # 강일동 -> 오류2동
+                             adm_cd2 == 1125076 ~ 1125052,  # 상일1동 -> 오류2동
+                             adm_cd2 == 1125077 ~ 1125052,  # 상일2동 -> 오류2동
+                             TRUE ~ adm_cd2) 
+  ) %>%
+  group_by(adm_cd2) %>% summarise(area_under40= sum(house_cnt))
+```
+- 유형구분 없이 30년 이상 주택수만 추출하였으므로 동단위 그룹핑 후 요약만 수행
+```{r}
+houseage <- read_delim("raw_input/seoul_houseage_2021.txt", delim ='\t', locale = locale(encoding = 'utf-8')) %>%
+  mutate(adm_cd2 = adm_cd / 10) %>% 
+  mutate(adm_cd2 = case_when(adm_cd2 == 1117073 ~ 1117068,  # 오류2동
+                             adm_cd2 == 1117074 ~ 1117068,  # 항동 -> 오류2동
+                             adm_cd2 == 1125075 ~ 1125051,  # 강일동 -> 오류2동
+                             adm_cd2 == 1125076 ~ 1125052,  # 상일1동 -> 오류2동
+                             adm_cd2 == 1125077 ~ 1125052,  # 상일2동 -> 오류2동
+                             TRUE ~ adm_cd2) 
+  ) %>%
+  group_by(adm_cd2) %>% summarise(age_over30= sum(house_cnt))
+```
+- 위의 세 데이터를 house라는 하나의 변수에 결합함
+```{r}
+house <- housetype %>%
+  left_join(housearea, by = c("adm_cd2")) %>%
+  left_join(houseage, by = c("adm_cd2"))
+```
+
+### 4) 동별 아파트 전세 1m2 당 평균 실거래가
+- 출처: 국토교통부 부동산 실거래가 시스템
+- 주의: 2022년 1년 간 모든 전세 실거래가임. 월세는 제외. 
+- 아파트 전세의 단위면적당 평균 실거래가임
+```{r}
+rentprice <- read_delim("raw_input/seoul_rentprice_apt.txt", delim ='\t') %>%
+  mutate(price_m2 = `보증금(만원)`/`전용면적(㎡)`) # 단위면적당 전세보증금(실거래가)로 변환
+
+sf_rentprice <- rentprice %>%
+  filter(x > 0) %>%  # 지오코딩 후 좌표 없는 건수 제외
+  st_as_sf(coords = c("x", "y"), crs = 4326) %>% st_transform(5179)
+
+rent_dong <- st_join(sf_rentprice, seoul, join = st_within) %>% # 서울 동 shp과 within 조건으로 공간조인함
+  st_drop_geometry() %>%
+  group_by(행정동코드) %>% 
+  summarise(avg_price = mean(price_m2)) # 단위면적에 대한 평균 실거래가로 전환
+```
+
+### 5) 동별 최단거리 대학 및 동별 대학 수
+- 출처: 대학알리미 대학현황정보
+- 알림: 2022년 상반기 기준정보임. 전문대 등은 제외하고 4년제 대학만 포함함
+
+```{r}
+sf_univ <- read_delim("raw_input/university_kedi_20220310.txt", delim =',', locale = locale(encoding = 'utf-8')) %>%
+  filter(학교구분 == "대학" & 지역 == "서울" & 학교상태 == "기존") %>% 
+  filter(x > 0) %>% # 지오코딩 후 좌표값 없는 경우 제외
+  st_as_sf(coords = c("x", "y"), crs = 5179)
+
+min_dist <- st_distance(dong_center, sf_univ) %>% # 동 중심점과 대학 포인트 간의 거리 계산
+  apply(1, min) # 거리행렬에서 가장 짧은 거리만 추출
+
+dist_univ <- data.frame(행정동코드 = dong_center$행정동코드, dist_univ = min_dist)
+```
+
+- 대학별 위치정보를 바탕으로 공간조인하여 동별 대학 수 계산
+```{r}
+univ_dong <-sf_univ %>%
+  st_join(seoul, join = st_within) %>% 
+  st_drop_geometry() %>%
+  group_by(행정동코드) %>% 
+  summarise(n_univ = n())
+```
+
+### 6) 동별 편의점 수
+- 출처: 생활안전정보 API
+- 알림: 도시활력지수와 다중공선성이 너무 높아 최종적으로 안씀
+
+```{r}
+sf_conv <- read_delim("raw_input/convenient_store_230818.txt", delim ='\t', locale = locale(encoding = 'utf-8')) %>%
+  st_as_sf(coords = c("X", "Y"), crs = 3857) %>% st_transform(5179) %>% # 3857(웹지도의 epsg) -> 5179 변환
+  st_join(seoul, join = st_within) %>%
+  st_drop_geometry() %>%
+  group_by(행정동코드) %>% 
+  summarise(n_conv = n())
+```
+
+### 7) 시민생활 데이터
+- 출처: 서울시 시민생활 데이터
+- 알림: 현재는 2022년 4월 데이터이므로 종속변수 시기 일치 감안하여 2023년 4월 데이터로 변경
+
+```{r}
+raw_life <- read_delim("clean_input/life_content/life_content_4.csv") %>%
+  select(-`...1`)
+```
+
+- 20~30대 1인 가구 비율(총인구수 대비 1인 가구수)
+```{r}
+single_2030_all <- raw_life %>%
+  filter(연령대 < 40 & 연령대 >= 20) %>%
+  group_by(행정동코드) %>%
+  summarise(single_all = sum(`1인가구수`)/sum(`총인구`))
+```
+
+- 20~30대 1인 가구 중 외출-커뮤니케이션이 모두 적은 집단 비율(총인구수 대비 청년 소외집단 비율)
+```{r}
+single_2030_low <- raw_life %>%
+  filter(연령대 < 40 & 연령대 >= 20) %>%
+  group_by(행정동코드) %>%
+  summarise(single_low = sum(`외출-커뮤니케이션이 모두 적은 집단`)/sum(`총인구`))
+```
+
+
+### 8) 도시활력지수(생활인구)
+- 출처: 서울시 생활인구
+- 알림: 2023년 4월 데이터 활용(휴일 등이 없어서). 평일만 활용
+```{r}
+raw_vital <- read_delim("clean_input/LOCAL_PEOPLE_DONG_202304.csv") %>%
+  mutate(시간대구분 = as.integer(시간대구분))
+
+admincode <- seoul_emd <-read_sf("clean_input/seoul_emd.shp") %>% # seoul_emd.shp(시민생활 코드예시에서 제공하는 shp)에서 seoul.shp과 연계할 결합코드 추출
+  st_drop_geometry() %>%
+  mutate(adm_cd3 = as.integer(substr(adm_cd2, 1, 8)), # 결합코드 보정
+         adm_cd = as.integer(adm_cd)) %>%
+  mutate(adm_cd3 = case_when(adm_cd3 == 11305595 ~ 11305590, # 강북구 번1동 ~ 3동, 강북구 수유1동 ~ 3동
+                             adm_cd3 == 11305603 ~ 11305600,
+                             adm_cd3 == 11305608 ~ 11305606,
+                             adm_cd3 == 11305615 ~ 11305610,
+                             adm_cd3 == 11305625 ~ 11305620,
+                             adm_cd3 == 11305635 ~ 11305630,
+                             TRUE ~ adm_cd3)) %>%
+  mutate(adm_cd = ifelse(adm_cd == 1117073, 1117068, adm_cd)) %>% # 오류2동 변경
+  select(adm_nm, adm_cd, adm_cd3)
+```
+- 평일 자료만 추출: 2023년 4월 중 평일리스트 추출한 뒤 필터링
+- 주간 사회적 도시활력 수준: 평일 10시 ~ 15시 사이 일별/시간대별 평균 실질인구(de facto population)
+- 야간 사회적 도시활력 수준: 평일 19시 ~ 22시 사이 일별/시간대별 평균 실질인구(de facto population)
+```{r}
+weekday<-c(20230403, 20230404, 20230405, 20230406, 20230410, 20230411, 20230412, 20230413, 20230417, 20230418, 20230419, 20230420, 20230424, 20230425, 20230426, 20230427)
+
+day_vital <-raw_vital %>%
+  filter(기준일ID %in% weekday) %>%
+  filter(시간대구분 > 9 & 시간대구분 < 16) %>%
+  group_by(행정동코드) %>%
+  summarise(day_vitality = mean(총생활인구수)) %>%
+  left_join(admincode, by = c("행정동코드" = "adm_cd3")) %>%
+  select(adm_cd, day_vitality)
+
+night_vital <-raw_vital %>%
+  filter(기준일ID %in% weekday) %>%
+  filter(시간대구분 > 18 & 시간대구분 < 23) %>%
+  group_by(행정동코드) %>%
+  summarise(night_vitality = mean(총생활인구수)) %>%
+  left_join(admincode, by = c("행정동코드" = "adm_cd3")) %>%
+  select(adm_cd, night_vitality)
+```
+
+### 9) 전체 분석변수 통합
+- seoul.shp 파일에 모든 데이터 통합하여 분석용 데이터 세트 구성
+
+```{r}
+analysis <- seoul %>%
+  left_join(single_2030_all, by = c("행정동코드")) %>%
+  left_join(single_2030_low, by = c("행정동코드")) %>%
+  left_join(day_vital, by = c("행정동코드" = "adm_cd")) %>%
+  left_join(night_vital, by = c("행정동코드" = "adm_cd")) %>%
+  left_join(subway, by = c("행정동코드")) %>%
+  left_join(busstop, by = c("행정동코드")) %>%
+  left_join(house, by = c("행정동코드" = "adm_cd2")) %>%
+  left_join(rent_dong, by = c("행정동코드")) %>%
+  left_join(dist_univ, by = c("행정동코드")) %>%
+  left_join(univ_dong, by = c("행정동코드")) %>%
+  left_join(sf_conv, by = c("행정동코드")) %>%
+  mutate(sgg_cd = substr(행정동코드, 1, 5))
+```
+
+- 데이터 조인 과정에서 발생하는 결측치의 경우 실제로 그 값이 0인 경우이므로 0으로 수정
+- 단, 전세 실거래가의 경우 거래발생이 없었기 때문에 나타나는 현상이므로 이후 수정 필요(대안 1. 최근 3년 실거래가 활용, 대안 2. 공시지가 활용(이 경우 매매가격이 됨))
+```{r}
+analysis[is.na(analysis)]<-0
+```
+
+# 회귀분석 수행
+### 1) 종속변수 분포 파악
+- 종속변수가 skewed 되어 회귀분석 가정 중 하나인 정규성이 위배될 가능성이 높음(엄밀히 말해서 회귀분석의 정규성 가정은 잔차의 분포에 해당)
+```{r}
+hist(analysis$single_all, freq=FALSE, xlab="청년 1인가구 비율")
+hist(analysis$single_low, freq=FALSE, xlab="청년 소외 1인가구 비율")
+```
+- 종속변수가 right-skewed 되었으므로, 로그변환하면 정규분포와 유사해짐
+```{r}
+hist(log(analysis$single_all), freq=FALSE, xlab="청년 1인가구 비율")
+hist(log(analysis$single_low), freq=FALSE, xlab="청년 소외 1인가구 비율")
+```
+
+### 2) OLS 수행
+- 4가지 모형에 대한 식을 제시
+1. 청년 1인가구 비율 ~ 주간 사회적 활력지수
+2. 청년 1인가구 비율 ~ 야간 사회적 활력지수 
+3. 청년 소외 1인가구 비율 ~ 주간 사회적 활력지수
+4. 청년 소외 1인가구 비율 ~ 야간 사회적 활력지수
+- 모형의 경우 개수 혹은 수량 데이터는 면적에 따른 차이를 보정해주기 위해서 면적으로 나누어서 계산. 필요한 경우 로그변환하여 처리.
+
+```{r}
+form_1 <- "log(single_all) ~ I(n_univ/area)+ I(area_under40/전체)+ I(아파트/전체) + log(avg_price+1) + log(day_vitality/area) + I(n_subway/area) + I(n_busstop/area)"
+form_2 <- "log(single_all) ~ I(n_univ/area)+ I(area_under40/전체)+ I(아파트/전체) + log(avg_price+1) + log(night_vitality/area) + I(n_subway/area) + I(n_busstop/area)"
+form_3 <- "log(single_low) ~ I(n_univ/area)+ I(area_under40/전체)+ I(아파트/전체) + log(avg_price+1) + log(day_vitality/area) + I(n_subway/area) + I(n_busstop/area)"
+form_4 <- "log(single_low) ~ I(n_univ/area)+ I(area_under40/전체)+ I(아파트/전체) + log(avg_price+1) + log(night_vitality/area) + I(n_subway/area) + I(n_busstop/area)"
+```
+
+- 종속변수와 독립변수 모두 로그변환한 경우: 독립변수 1% 변화에 따른 종속변수의 b% 변화량으로 해석
+- 독립변수 로그변환 안한 경우: 독립변수 1단위 변화에 따른 종속변수의 b% 변화량으로 해석
+
+
+- 모형 1: 청년 1인가구 비율 및 주간활력지수 모형
+```{r}
+model_1 <- lm(form_1, data = analysis)
+summary(model_1)
+```
+
+- 모형 2: 청년 1인가구 비율 및 야간활력지수 모형
+```{r}
+model_2 <- lm(form_2, data = analysis)
+summary(model_2)
+```
+
+- 모형 3: 청년 소외 1인가구 비율 및 주간활력지수 모형
+```{r}
+model_3 <- lm(form_3, data = analysis)
+summary(model_3)
+```
+
+- 모형 4: 청년 소외 1인가구 비율 및 야간활력지수 모형
+```{r}
+model_4 <- lm(form_4, data = analysis)
+summary(model_4)
+```
+
+
+### 3) OLS 회귀진단
+1. 모형 1에 대한 회귀진단
+```{r}
+plot(resid(model_1)) # 이분산성, 정규성 검토
+car::vif(model_1) # 다중공선성 검토 (2~3이하면 충분)
+lmtest::bptest(model_1) # 이분산성 검토: 유의하면 문제
+lmtest::dwtest(model_1) # 자기상관성 검토: 유의하면 문제
+```
+2. 모형 2에 대한 회귀진단
+```{r}
+plot(resid(model_2)) # 이분산성, 정규성 검토
+car::vif(model_2) # 다중공선성 검토 (2~3이하면 충분)
+lmtest::bptest(model_2) # 이분산성 검토: 유의하면 문제
+lmtest::dwtest(model_2) # 자기상관성 검토: 유의하면 문제
+```
+3. 모형 3에 대한 회귀진단
+```{r}
+plot(resid(model_3)) # 이분산성, 정규성 검토
+car::vif(model_3) # 다중공선성 검토 (2~3이하면 충분)
+lmtest::bptest(model_3) # 이분산성 검토: 유의하면 문제
+lmtest::dwtest(model_3) # 자기상관성 검토: 유의하면 문제
+```
+
+4. 모형 4에 대한 회귀진단
+```{r}
+plot(resid(model_4)) # 이분산성, 정규성 검토
+car::vif(model_4) # 다중공선성 검토 (2~3이하면 충분)
+lmtest::bptest(model_4) # 이분산성 검토: 유의하면 문제
+lmtest::dwtest(model_4) # 자기상관성 검토: 유의하면 문제
+```
+
+
+# leaflet을 이용한 동적 시각화
+### 1) vitality 시각화 
+- 수정 필요: day_vitality / night_vitality 모두 area로 나눠서 시각화 하는게 나을 듯
+
+```{r}
+library(leaflet)
+analysis_wgs84 <- st_transform(analysis, 4326) # EPSG: 4326만 허용
+
+leaflet() %>%
+  addTiles() %>% # OSM 베이스맵을 활용할 때 사용
+  setView(lng=127, lat=37.6, zoom=11) %>%
+  addPolygons(
+    data = analysis_wgs84,
+    fillColor = ~colorNumeric(palette = "YlOrRd", domain = analysis_wgs84$day_vitality)(day_vitality),
+    fillOpacity = 0.7,
+    color = "white",
+    weight = 1, 
+    label = ~paste(analysis_wgs84$행정동명, ": ", day_vitality),
+    group = "day_vitality"
+  ) %>%
+  addPolygons(
+    data = analysis_wgs84,
+    fillColor = ~colorNumeric(palette = "YlOrRd", domain = analysis_wgs84$night_vitality)(night_vitality),
+    fillOpacity = 0.7,
+    color = "white",
+    weight = 1, 
+    label = ~paste(analysis_wgs84$행정동명, ": ", night_vitality),
+    group = "night_vitality"
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    pal = colorNumeric(palette = "YlOrRd", domain = analysis_wgs84$day_vitality),
+    values = analysis_wgs84$day_vitality,
+    title = "Value",
+    group = "day_vitality"
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    pal = colorNumeric(palette = "YlOrRd", domain = analysis_wgs84$night_vitality),
+    values = analysis_wgs84$night_vitality,
+    title = "Value",
+    group = "night_vitality"
+  ) %>%
+  addLayersControl(
+    baseGroups = c("OSM"),
+    overlayGroups =  c("day_vitality", "night_vitality"),
+    position = c("bottomright"))
+```
+
+### 2) 1인가구 분포 시각화 
+
+```{r}
+library(leaflet)
+analysis_wgs84 <- st_transform(analysis, 4326) # EPSG: 4326만 허용
+
+leaflet() %>%
+  addTiles() %>% # OSM 베이스맵을 활용할 때 사용
+  setView(lng=127, lat=37.6, zoom=11) %>%
+  addPolygons(
+    data = analysis_wgs84,
+    fillColor = ~colorNumeric(palette = "YlOrRd", domain = analysis_wgs84$single_all)(single_all),
+    fillOpacity = 0.7,
+    color = "white",
+    weight = 1, 
+    label = ~paste(analysis_wgs84$행정동명, ": ", single_all),
+    group = "청년 1인가구(전체)"
+  ) %>%
+  addPolygons(
+    data = analysis_wgs84,
+    fillColor = ~colorNumeric(palette = "YlOrRd", domain = analysis_wgs84$single_low)(single_low),
+    fillOpacity = 0.7,
+    color = "white",
+    weight = 1, 
+    label = ~paste(analysis_wgs84$행정동명, ": ", single_low),
+    group = "청년 1인가구(소외집단)"
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    pal = colorNumeric(palette = "YlOrRd", domain = analysis_wgs84$single_all),
+    values = analysis_wgs84$single_all,
+    title = "Value",
+    group = "청년 1인가구(전체)"
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    pal = colorNumeric(palette = "YlOrRd", domain = analysis_wgs84$single_low),
+    values = analysis_wgs84$single_low,
+    title = "Value",
+    group = "청년 1인가구(소외집단)"
+  ) %>%
+  addLayersControl(
+    baseGroups = c("OSM"),
+    overlayGroups =  c("청년 1인가구(전체)", "청년 1인가구(소외집단)"),
+    position = c("bottomright"))
+```
+```
+
