@@ -1,15 +1,13 @@
 
-
 library(tidyverse)
 library(sf)
-library(httr)
-library(jsonlite)
 library(lmtest)
 library(sandwich)
 library(readxl)
 library(glue)
+library(rgeoda)
 
-setwd("D:/Analysis/single_house/")
+setwd("~/Library/Mobile Documents/com~apple~CloudDocs/Analysis/single_house")
 
 ## 데이터 가져오기
 seoul <- read_sf("clean_input/seoul.gpkg") %>%
@@ -133,14 +131,9 @@ park <- park %>%
   select(행정동코드, park)
 
 # 7) POI
-poi <- read_csv("raw_input/poi_data_not_na.csv", locale = locale(encoding = 'cp949'))
-
-%>%
+poi <- read_csv("raw_input/poi_data_not_na.csv", locale = locale(encoding = 'cp949')) %>%
   filter(영업상태구분코드 == 1) %>%
   select(개방서비스명, `좌표정보(x)`, `좌표정보(y)`)
-
-tmp <- poi %>% filter(개방서비스명 %in% c("병원", "의원"))
-unique(tmp$업태구분명)
 
 hospital <- poi %>%
   filter(개방서비스명 %in% c("병원", "의원")) %>%
@@ -251,7 +244,8 @@ older <- raw_life %>%
 
 
 # 7) 도시활력(생활인구)
-raw_vital <- read_delim("clean_input/LOCAL_PEOPLE_DONG_202304.csv") %>%
+raw_vital <- read_delim("clean_input/LOCAL_PEOPLE_DONG_202304.txt", delim  = '|', 
+                        locale = locale(encoding = 'cp949')) %>%
   mutate(시간대구분 = as.integer(시간대구분))
 admincode <- seoul_emd <-read_sf("clean_input/seoul_emd.shp") %>%
   st_drop_geometry() %>%
@@ -408,6 +402,38 @@ library(stargazer)
 
 out_path<-glue("C:/Users/Kyusang/Desktop/{dep}.html")
 stargazer(err_reg, title = "results", alight=TRUE, type="html", out = out_path)
+
+
+## 지도화
+w <- queen_weights(analysis)
+lisa <- local_moran(w, analysis['single_2029_s']/analysis['pop'])
+
+lisa_color <- lisa_colors(lisa)
+lisa_label <- lisa_labels(lisa)
+lisa_cluster <- lisa_clusters(lisa)
+
+plot(st_geometry(analysis),
+     col = sapply(lisa_cluster, function(x){return(lisa_color[[x+1]])}),
+     border = "#333333", lwd=0.2)
+title(main = "Local Moran Map of One-Person Household per Person")
+legend('topleft', legend = lisa_label, fill = lisa_color, border = "#eeeeee")
+
+## 단계구분도
+library(tmap)
+
+analysis <- analysis %>%
+  mutate()
+
+tm_shape(analysis) +
+  tm_fill("single_2039", style = "jenks", n = 6, 
+          legend.hist = FALSE, title = "Age 20-39",
+          palette = "-RdBu") +
+  tm_borders() +
+  tm_layout(legend.outside = FALSE,
+            legend.outside.position = "right") +
+  tm_scale_bar(position = c("left", "bottom")) +
+  tm_compass(position = c("right", "top"))
+
 
 ## leaflet을 사용한 시각화
 library(leaflet)
